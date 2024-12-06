@@ -1,0 +1,169 @@
+---
+title: "stats506hw6"
+author: "Qichang Wan"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show the code"
+    embed-resources: true
+editor: visual
+---
+
+Link to github: https://github.com/Tealeaf2001/stats-506-hw6.git
+
+
+## (a)
+```{r}
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(parallel)
+library(future)
+library(future.apply)
+
+
+db_path <- "lahman_1871-2022.sqlite" 
+conn <- dbConnect(SQLite(), db_path)
+
+
+fielding_data <- dbGetQuery(conn, "
+  SELECT teamID, PO, A, InnOuts
+  FROM Fielding
+  WHERE InnOuts IS NOT NULL AND PO IS NOT NULL AND A IS NOT NULL AND InnOuts > 0;
+")
+
+dbDisconnect(conn)
+
+
+fielding_data <- fielding_data %>%
+  mutate(RF = 3 * (PO + A) / InnOuts)
+
+# Calculate average RF by team
+team_rf <- fielding_data %>%
+  group_by(teamID) %>%
+  summarise(avg_RF = mean(RF, na.rm = TRUE))
+
+# Function for stratified bootstrap
+stratified_bootstrap <- function(data, n_bootstraps = 1000) {
+  bootstrapped_means <- numeric(n_bootstraps)
+  
+  for (i in 1:n_bootstraps) {
+    resampled <- data %>%
+      group_by(teamID) %>%
+      slice_sample(prop = 1, replace = TRUE) %>%
+      ungroup()
+    bootstrapped_means[i] <- mean(resampled$RF, na.rm = TRUE)
+  }
+  
+  return(bootstrapped_means)
+}
+
+# 1. Without Parallel Processing
+set.seed(123)
+non_parallel_results <- stratified_bootstrap(fielding_data)
+
+# 2. Using the parallel package
+stratified_bootstrap_parallel <- function(data, n_bootstraps = 1000) {
+  cl <- makeCluster(detectCores() - 1) # Use all but one core
+  clusterExport(cl, varlist = c("data", "slice_sample"), envir = environment())
+  clusterEvalQ(cl, library(dplyr))
+  
+  bootstrapped_means <- parLapply(cl, 1:n_bootstraps, function(x) {
+    resampled <- data %>%
+      group_by(teamID) %>%
+      slice_sample(prop = 1, replace = TRUE) %>%
+      ungroup()
+    mean(resampled$RF, na.rm = TRUE)
+  })
+  
+  stopCluster(cl)
+  return(unlist(bootstrapped_means))
+}
+
+set.seed(123)
+parallel_results <- stratified_bootstrap_parallel(fielding_data)
+
+# 3. Using the future package
+stratified_bootstrap_future <- function(data, n_bootstraps = 1000) {
+  plan(multisession) 
+  
+  bootstrapped_means <- future_lapply(1:n_bootstraps, function(x) {
+    resampled <- data %>%
+      group_by(teamID) %>%
+      slice_sample(prop = 1, replace = TRUE) %>%
+      ungroup()
+    mean(resampled$RF, na.rm = TRUE)
+  })
+  
+  plan(sequential) 
+  return(unlist(bootstrapped_means))
+}
+
+set.seed(123)
+future_results <- stratified_bootstrap_future(fielding_data)
+
+
+summary(non_parallel_results)
+summary(parallel_results)
+summary(future_results)
+
+# Compare the bootstrap results visually
+hist(non_parallel_results, main = "Bootstrap RF - Non Parallel", xlab = "Mean RF", breaks = 30)
+hist(parallel_results, main = "Bootstrap RF - Parallel", xlab = "Mean RF", breaks = 30)
+hist(future_results, main = "Bootstrap RF - Future", xlab = "Mean RF", breaks = 30)
+
+```
+## (b)
+```{r}
+non_parallel_summary <- data.frame(
+  teamID = team_rf$teamID,
+  mean_RF_non_parallel = team_rf$avg_RF,
+  se_RF_non_parallel = sd(non_parallel_results)
+)
+
+parallel_summary <- data.frame(
+  teamID = team_rf$teamID,
+  mean_RF_parallel = team_rf$avg_RF,
+  se_RF_parallel = sd(parallel_results)
+)
+
+future_summary <- data.frame(
+  teamID = team_rf$teamID,
+  mean_RF_future = team_rf$avg_RF,
+  se_RF_future = sd(future_results)
+)
+
+# Merge results into one table
+combined_summary <- non_parallel_summary %>%
+  inner_join(parallel_summary, by = "teamID") %>%
+  inner_join(future_summary, by = "teamID")
+
+# Select the top 10 teams with the highest RF based on the non-parallel results
+top_10_teams <- combined_summary %>%
+  arrange(desc(mean_RF_non_parallel)) %>%
+  slice(1:10)
+
+# Display the table
+print(top_10_teams)
+
+```
+## (c)
+```{r}
+library(microbenchmark)
+
+# Measure execution time for each approach
+set.seed(1) 
+time_results <- microbenchmark(
+  NonParallel = stratified_bootstrap(fielding_data, n_bootstraps = 1000),
+  Parallel = stratified_bootstrap_parallel(fielding_data, n_bootstraps = 1000),
+  Future = stratified_bootstrap_future(fielding_data, n_bootstraps = 1000),
+  times = 3 # Run each method 3 times to get an average
+)
+
+print(time_results)
+
+time_summary <- summary(time_results)
+print(time_summary)
+
+```
+we can see the non parallel method requires most time. Parallel method is much better and the future method is the best.
